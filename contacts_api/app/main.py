@@ -1,14 +1,30 @@
-from ... import auth
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
-from fastapi.security import OAuth2PasswordRequestForm
-
-from . import crud, models, schemas
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+from jose import JWTError, jwt
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+import aioredis
+from . import crud, models, schemas, auth, utils, cloudinary_utils
 from .database import SessionLocal, engine
 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup():
+    auth.redis = await aioredis.create_redis_pool("redis://localhost")
+    await FastAPILimiter.init(auth.redis)
 
 def get_db():
     db = SessionLocal()
@@ -17,69 +33,68 @@ def get_db():
     finally:
         db.close()
 
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+@app.get("/verify-email/")
+def verify_email(token: str, db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=400, detail="Invalid token")
+        user = crud.get_user_by_email(db, email=email)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user.is_verified = True
+        db.commit()
+        return {"msg": "Email verified successfully"}
+    except JWTError:
+        raise HTTPException(status_code=400, detail="Invalid token")
+
 @app.post("/users/", response_model=schemas.User, status_code=status.HTTP_201_CREATED)
 def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
     db_user = crud.get_user_by_email(db, email=user.email)
     if db_user:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    return crud.create_user(db=db, user=user)
+    db_user = crud.create_user(db=db, user=user)
+    verification_token = auth.create_verification_token(data={"sub": user.email})
+    utils.send_verification_email(user.email, verification_token)
+    return db_user
 
-@app.post("/token", response_model=schemas.Token)
-def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = auth.authenticate_user(db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=auth.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = auth.create_access_token(
-        data={"sub": user.email}, expires_delta=access_token_expires
-    )
-    refresh_token = auth.create_refresh_token(data={"sub": user.email})
-    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
-
-@app.get("/users/me", response_model=schemas.User)
-def read_users_me(current_user: schemas.User = Depends(auth.get_current_active_user)):
-    return current_user
-
-@app.post("/contacts/", response_model=schemas.Contact, status_code=status.HTTP_201_CREATED)
-def create_contact(contact: schemas.ContactCreate, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
+@app.post("/contacts/", response_model=schemas.Contact, status_code=status.HTTP_201_CREATED, dependencies=[Depends(RateLimiter(times=5, seconds=60))])
+def create_contact(contact: schemas.ContactCreate, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_user)):
     return crud.create_contact(db=db, contact=contact, user_id=current_user.id)
 
-@app.get("/contacts/", response_model=list[schemas.Contact])
-def read_contacts(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
-    contacts = crud.get_contacts(db, user_id=current_user.id, skip=skip, limit=limit)
-    return contacts
+@app.post("/users/avatar/")
+def update_avatar(file: UploadFile = File(...), current_user: schemas.User = Depends(auth.get_current_user), db: Session = Depends(get_db)):
+    file_location = f"tmp/{file.filename}"
+    with open(file_location, "wb+") as file_object:
+        file_object.write(file.file.read())
+    avatar_url = cloudinary_utils.upload_avatar(file_location)
+    current_user.avatar_url = avatar_url
+    db.commit()
+    return {"avatar_url": avatar_url}
 
-@app.get("/contacts/{contact_id}", response_model=schemas.Contact)
-def read_contact(contact_id: int, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
-    db_contact = crud.get_contact(db, user_id=current_user.id, contact_id=contact_id)
-    if db_contact is None:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    return db_contact
+@app.post("/reset-password/")
+def reset_password_request(email: str, db: Session = Depends(get_db)):
+    user = crud.get_user_by_email(db, email=email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    reset_token = auth.create_verification_token(data={"sub": user.email})
+    utils.send_reset_password_email(email, reset_token)
 
-@app.put("/contacts/{contact_id}", response_model=schemas.Contact)
-def update_contact(contact_id: int, contact: schemas.ContactCreate, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
-    db_contact = crud.update_contact(db, user_id=current_user.id, contact_id=contact_id, contact=contact)
-    if db_contact is None:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    return db_contact
-
-@app.delete("/contacts/{contact_id}", response_model=schemas.Contact)
-def delete_contact(contact_id: int, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
-    db_contact = crud.delete_contact(db, user_id=current_user.id, contact_id=contact_id)
-    if db_contact is None:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    return db_contact
-
-@app.get("/contacts/search/", response_model=list[schemas.Contact])
-def search_contacts(query: str, db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
-    contacts = crud.search_contacts(db, user_id=current_user.id, query=query)
-    return contacts
-
-@app.get("/contacts/upcoming_birthdays/", response_model=list[schemas.Contact])
-def upcoming_birthdays(db: Session = Depends(get_db), current_user: schemas.User = Depends(auth.get_current_active_user)):
-    contacts = crud.get_upcoming_birthdays(db, user_id=current_user.id)
-    return contacts
+@app.post("/reset-password/confirm/")
+def reset_password_confirm(token: str, new_password: str, db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=400, detail="Invalid token")
+        user = crud.get_user_by_email(db, email=email)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user.hashed_password = auth.get_password_hash(new_password)
+        db.commit()
+        return {"msg": "Password reset successfully"}
+    except JWTError:
+        raise HTTPException(status_code=400, detail="Invalid token")
